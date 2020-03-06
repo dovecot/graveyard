@@ -1,0 +1,993 @@
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -871,6 +871,7 @@ src/lib-storage/index/mbox/Makefile
+ src/lib-storage/index/dbox-common/Makefile
+ src/lib-storage/index/dbox-multi/Makefile
+ src/lib-storage/index/dbox-single/Makefile
++src/lib-storage/index/cydir/Makefile
+ src/lib-storage/index/raw/Makefile
+ src/lib-storage/index/shared/Makefile
+ src/anvil/Makefile
+diff --git a/src/lib-storage/Makefile.am b/src/lib-storage/Makefile.am
+--- a/src/lib-storage/Makefile.am
++++ b/src/lib-storage/Makefile.am
+@@ -109,6 +109,7 @@ shlibs = \
+ 	index/dbox-common/libstorage_dbox_common.la \
+ 	index/maildir/libstorage_maildir.la \
+ 	index/mbox/libstorage_mbox.la \
++	index/cydir/libstorage_cydir.la \
+ 	index/imapc/libstorage_imapc.la \
+ 	../lib-imap-client/libimap_client.la \
+ 	index/pop3c/libstorage_pop3c.la \
+diff --git a/src/lib-storage/index/Makefile.am b/src/lib-storage/index/Makefile.am
+--- a/src/lib-storage/index/Makefile.am
++++ b/src/lib-storage/index/Makefile.am
+@@ -1,4 +1,4 @@
+-SUBDIRS = maildir mbox dbox-common dbox-multi dbox-single imapc pop3c raw shared
++SUBDIRS = maildir mbox dbox-common dbox-multi dbox-single cydir imapc pop3c raw shared
+ 
+ noinst_LTLIBRARIES = libstorage_index.la
+ 
+diff --git a/src/lib-storage/index/cydir/Makefile.am b/src/lib-storage/index/cydir/Makefile.am
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/Makefile.am
+@@ -0,0 +1,22 @@
++noinst_LTLIBRARIES = libstorage_cydir.la
++
++AM_CPPFLAGS = \
++	-I$(top_srcdir)/src/lib \
++	-I$(top_srcdir)/src/lib-mail \
++	-I$(top_srcdir)/src/lib-imap \
++	-I$(top_srcdir)/src/lib-index \
++	-I$(top_srcdir)/src/lib-storage \
++	-I$(top_srcdir)/src/lib-storage/index
++
++libstorage_cydir_la_SOURCES = \
++	cydir-mail.c \
++	cydir-save.c \
++	cydir-sync.c \
++	cydir-storage.c
++
++headers = \
++	cydir-storage.h \
++	cydir-sync.h
++
++pkginc_libdir=$(pkgincludedir)
++pkginc_lib_HEADERS = $(headers)
+diff --git a/src/lib-storage/index/cydir/cydir-mail.c b/src/lib-storage/index/cydir/cydir-mail.c
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/cydir-mail.c
+@@ -0,0 +1,169 @@
++/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
++
++#include "lib.h"
++#include "istream.h"
++#include "index-mail.h"
++#include "cydir-storage.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++
++static const char *cydir_mail_get_path(struct mail *mail)
++{
++	const char *dir;
++
++	dir = mailbox_get_path(mail->box);
++	return t_strdup_printf("%s/%u.", dir, mail->uid);
++}
++
++static int cydir_mail_stat(struct mail *mail, struct stat *st_r)
++{
++	const char *path;
++
++	if (mail->lookup_abort >= MAIL_LOOKUP_ABORT_NOT_IN_CACHE) {
++		mail_set_aborted(mail);
++		return -1;
++	}
++	mail->mail_metadata_accessed = TRUE;
++
++	mail->transaction->stats.stat_lookup_count++;
++	path = cydir_mail_get_path(mail);
++	if (stat(path, st_r) < 0) {
++		if (errno == ENOENT)
++			mail_set_expunged(mail);
++		else {
++			mail_set_critical(mail, "stat(%s) failed: %m", path);
++		}
++		return -1;
++	}
++	return 0;
++}
++
++static int cydir_mail_get_received_date(struct mail *_mail, time_t *date_r)
++{
++	struct index_mail *mail = INDEX_MAIL(_mail);
++	struct index_mail_data *data = &mail->data;
++	struct stat st;
++
++	if (index_mail_get_received_date(_mail, date_r) == 0)
++		return 0;
++
++	if (cydir_mail_stat(_mail, &st) < 0)
++		return -1;
++
++	data->received_date = st.st_mtime;
++	*date_r = data->received_date;
++	return 0;
++}
++
++static int cydir_mail_get_save_date(struct mail *_mail, time_t *date_r)
++{
++	struct index_mail *mail = INDEX_MAIL(_mail);
++	struct index_mail_data *data = &mail->data;
++	struct stat st;
++
++	if (index_mail_get_save_date(_mail, date_r) == 0)
++		return 0;
++
++	if (cydir_mail_stat(_mail, &st) < 0)
++		return -1;
++
++	data->save_date = st.st_ctime;
++	*date_r = data->save_date;
++	return 0;
++}
++
++static int cydir_mail_get_physical_size(struct mail *_mail, uoff_t *size_r)
++{
++	struct index_mail *mail = INDEX_MAIL(_mail);
++	struct index_mail_data *data = &mail->data;
++	struct stat st;
++
++	if (index_mail_get_physical_size(_mail, size_r) == 0)
++		return 0;
++
++	if (cydir_mail_stat(_mail, &st) < 0)
++		return -1;
++
++	data->physical_size = data->virtual_size = st.st_size;
++	*size_r = data->physical_size;
++	return 0;
++}
++
++static int
++cydir_mail_get_stream(struct mail *_mail, bool get_body ATTR_UNUSED,
++		      struct message_size *hdr_size,
++		      struct message_size *body_size,
++		      struct istream **stream_r)
++{
++	struct index_mail *mail = INDEX_MAIL(_mail);
++	struct istream *input;
++	const char *path;
++	int fd;
++
++	if (mail->data.stream == NULL) {
++		_mail->transaction->stats.open_lookup_count++;
++		path = cydir_mail_get_path(_mail);
++		fd = open(path, O_RDONLY);
++		if (fd == -1) {
++			if (errno == ENOENT)
++				mail_set_expunged(_mail);
++			else {
++				mail_set_critical(_mail, "open(%s) failed: %m",
++						  path);
++			}
++			return -1;
++		}
++		input = i_stream_create_fd_autoclose(&fd, 0);
++		i_stream_set_name(input, path);
++		index_mail_set_read_buffer_size(_mail, input);
++		if (mail->mail.v.istream_opened != NULL) {
++			if (mail->mail.v.istream_opened(_mail, &input) < 0) {
++				i_stream_unref(&input);
++				return -1;
++			}
++		}
++		mail->data.stream = input;
++	}
++
++	return index_mail_init_stream(mail, hdr_size, body_size, stream_r);
++}
++
++struct mail_vfuncs cydir_mail_vfuncs = {
++	index_mail_close,
++	index_mail_free,
++	index_mail_set_seq,
++	index_mail_set_uid,
++	index_mail_set_uid_cache_updates,
++	index_mail_prefetch,
++	index_mail_precache,
++	index_mail_add_temp_wanted_fields,
++
++	index_mail_get_flags,
++	index_mail_get_keywords,
++	index_mail_get_keyword_indexes,
++	index_mail_get_modseq,
++	index_mail_get_pvt_modseq,
++	index_mail_get_parts,
++	index_mail_get_date,
++	cydir_mail_get_received_date,
++	cydir_mail_get_save_date,
++	cydir_mail_get_physical_size, /* physical = virtual in our case */
++	cydir_mail_get_physical_size,
++	index_mail_get_first_header,
++	index_mail_get_headers,
++	index_mail_get_header_stream,
++	cydir_mail_get_stream,
++	index_mail_get_binary_stream,
++	index_mail_get_special,
++	index_mail_get_backend_mail,
++	index_mail_update_flags,
++	index_mail_update_keywords,
++	index_mail_update_modseq,
++	index_mail_update_pvt_modseq,
++	NULL,
++	index_mail_expunge,
++	index_mail_set_cache_corrupted,
++	index_mail_opened,
++};
+diff --git a/src/lib-storage/index/cydir/cydir-save.c b/src/lib-storage/index/cydir/cydir-save.c
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/cydir-save.c
+@@ -0,0 +1,304 @@
++/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
++
++#include "lib.h"
++#include "array.h"
++#include "hostpid.h"
++#include "istream.h"
++#include "istream-crlf.h"
++#include "ostream.h"
++#include "str.h"
++#include "index-mail.h"
++#include "cydir-storage.h"
++#include "cydir-sync.h"
++
++#include <stdio.h>
++#include <utime.h>
++
++struct cydir_save_context {
++	struct mail_save_context ctx;
++
++	struct cydir_mailbox *mbox;
++	struct mail_index_transaction *trans;
++
++	char *tmp_basename;
++	unsigned int mail_count;
++
++	struct cydir_sync_context *sync_ctx;
++
++	/* updated for each appended mail: */
++	uint32_t seq;
++	struct istream *input;
++	int fd;
++
++	bool failed:1;
++	bool finished:1;
++};
++
++#define CYDIR_SAVECTX(s)	container_of(s, struct cydir_save_context, ctx)
++
++static char *cydir_generate_tmp_filename(void)
++{
++	static unsigned int create_count = 0;
++
++	return i_strdup_printf("temp.%s.P%sQ%uM%s.%s",
++			       dec2str(ioloop_timeval.tv_sec), my_pid,
++			       create_count++,
++			       dec2str(ioloop_timeval.tv_usec), my_hostname);
++}
++
++static const char *
++cydir_get_save_path(struct cydir_save_context *ctx, unsigned int num)
++{
++	const char *dir;
++
++	dir = mailbox_get_path(&ctx->mbox->box);
++	return t_strdup_printf("%s/%s.%u", dir, ctx->tmp_basename, num);
++}
++
++struct mail_save_context *
++cydir_save_alloc(struct mailbox_transaction_context *t)
++{
++	struct cydir_mailbox *mbox = CYDIR_MAILBOX(t->box);
++	struct cydir_save_context *ctx;
++
++	i_assert((t->flags & MAILBOX_TRANSACTION_FLAG_EXTERNAL) != 0);
++
++	if (t->save_ctx == NULL) {
++		ctx = i_new(struct cydir_save_context, 1);
++		ctx->ctx.transaction = t;
++		ctx->mbox = mbox;
++		ctx->trans = t->itrans;
++		ctx->tmp_basename = cydir_generate_tmp_filename();
++		ctx->fd = -1;
++		t->save_ctx = &ctx->ctx;
++	}
++	return t->save_ctx;
++}
++
++int cydir_save_begin(struct mail_save_context *_ctx, struct istream *input)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++	struct mailbox_transaction_context *trans = _ctx->transaction;
++	enum mail_flags save_flags;
++	struct istream *crlf_input;
++
++	ctx->failed = FALSE;
++
++	T_BEGIN {
++		const char *path;
++
++		path = cydir_get_save_path(ctx, ctx->mail_count);
++		ctx->fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0660);
++		if (ctx->fd != -1) {
++			_ctx->data.output =
++				o_stream_create_fd_file(ctx->fd, 0, FALSE);
++			o_stream_set_name(_ctx->data.output, path);
++			o_stream_cork(_ctx->data.output);
++		} else {
++			mailbox_set_critical(trans->box, "open(%s) failed: %m",
++					     path);
++			ctx->failed = TRUE;
++		}
++	} T_END;
++	if (ctx->failed)
++		return -1;
++
++	/* add to index */
++	save_flags = _ctx->data.flags & ~MAIL_RECENT;
++	mail_index_append(ctx->trans, 0, &ctx->seq);
++	mail_index_update_flags(ctx->trans, ctx->seq, MODIFY_REPLACE,
++				save_flags);
++	if (_ctx->data.keywords != NULL) {
++		mail_index_update_keywords(ctx->trans, ctx->seq,
++					   MODIFY_REPLACE, _ctx->data.keywords);
++	}
++	if (_ctx->data.min_modseq != 0) {
++		mail_index_update_modseq(ctx->trans, ctx->seq,
++					 _ctx->data.min_modseq);
++	}
++
++	mail_set_seq_saving(_ctx->dest_mail, ctx->seq);
++
++	crlf_input = i_stream_create_crlf(input);
++	ctx->input = index_mail_cache_parse_init(_ctx->dest_mail, crlf_input);
++	i_stream_unref(&crlf_input);
++	return ctx->failed ? -1 : 0;
++}
++
++int cydir_save_continue(struct mail_save_context *_ctx)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++
++	if (ctx->failed)
++		return -1;
++
++	if (index_storage_save_continue(_ctx, ctx->input,
++					_ctx->dest_mail) < 0) {
++		ctx->failed = TRUE;
++		return -1;
++	}
++	return 0;
++}
++
++static int cydir_save_flush(struct cydir_save_context *ctx, const char *path)
++{
++	struct mail_storage *storage = &ctx->mbox->storage->storage;
++	struct mailbox *box = &ctx->mbox->box;
++	struct stat st;
++	int ret = 0;
++
++	if (o_stream_finish(ctx->ctx.data.output) < 0) {
++		mailbox_set_critical(box, "write(%s) failed: %s", path,
++			o_stream_get_error(ctx->ctx.data.output));
++		ret = -1;
++	}
++
++	if (storage->set->parsed_fsync_mode != FSYNC_MODE_NEVER) {
++		if (fsync(ctx->fd) < 0) {
++			mailbox_set_critical(box, "fsync(%s) failed: %m", path);
++			ret = -1;
++		}
++	}
++
++	if (ctx->ctx.data.received_date == (time_t)-1) {
++		if (fstat(ctx->fd, &st) == 0)
++			ctx->ctx.data.received_date = st.st_mtime;
++		else {
++			mailbox_set_critical(box, "fstat(%s) failed: %m", path);
++			ret = -1;
++		}
++	} else {
++		struct utimbuf ut;
++
++		ut.actime = ioloop_time;
++		ut.modtime = ctx->ctx.data.received_date;
++		if (utime(path, &ut) < 0) {
++			mailbox_set_critical(box, "utime(%s) failed: %m", path);
++			ret = -1;
++		}
++	}
++
++	o_stream_destroy(&ctx->ctx.data.output);
++	if (close(ctx->fd) < 0) {
++		mailbox_set_critical(box, "close(%s) failed: %m", path);
++		ret = -1;
++	}
++	ctx->fd = -1;
++	return ret;
++}
++
++int cydir_save_finish(struct mail_save_context *_ctx)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++	const char *path = cydir_get_save_path(ctx, ctx->mail_count);
++
++	ctx->finished = TRUE;
++
++	if (ctx->fd != -1) {
++		if (cydir_save_flush(ctx, path) < 0)
++			ctx->failed = TRUE;
++	}
++
++	if (!ctx->failed)
++		ctx->mail_count++;
++	else
++		i_unlink(path);
++
++	index_mail_cache_parse_deinit(_ctx->dest_mail,
++				      _ctx->data.received_date, !ctx->failed);
++	i_stream_unref(&ctx->input);
++
++	index_save_context_free(_ctx);
++	return ctx->failed ? -1 : 0;
++}
++
++void cydir_save_cancel(struct mail_save_context *_ctx)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++
++	ctx->failed = TRUE;
++	(void)cydir_save_finish(_ctx);
++}
++
++int cydir_transaction_save_commit_pre(struct mail_save_context *_ctx)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++	struct mailbox_transaction_context *_t = _ctx->transaction;
++	const struct mail_index_header *hdr;
++	struct seq_range_iter iter;
++	uint32_t uid;
++	const char *dir;
++	string_t *src_path, *dest_path;
++	unsigned int n;
++	size_t src_prefixlen, dest_prefixlen;
++
++	i_assert(ctx->finished);
++
++	if (cydir_sync_begin(ctx->mbox, &ctx->sync_ctx, TRUE) < 0) {
++		ctx->failed = TRUE;
++		cydir_transaction_save_rollback(_ctx);
++		return -1;
++	}
++
++	hdr = mail_index_get_header(ctx->sync_ctx->sync_view);
++	mail_index_append_finish_uids(ctx->trans, hdr->next_uid,
++				      &_t->changes->saved_uids);
++	_t->changes->uid_validity = ctx->sync_ctx->uid_validity;
++
++	dir = mailbox_get_path(&ctx->mbox->box);
++
++	src_path = t_str_new(256);
++	str_printfa(src_path, "%s/%s.", dir, ctx->tmp_basename);
++	src_prefixlen = str_len(src_path);
++
++	dest_path = t_str_new(256);
++	str_append(dest_path, dir);
++	str_append_c(dest_path, '/');
++	dest_prefixlen = str_len(dest_path);
++
++	seq_range_array_iter_init(&iter, &_t->changes->saved_uids); n = 0;
++	while (seq_range_array_iter_nth(&iter, n++, &uid)) {
++		str_truncate(src_path, src_prefixlen);
++		str_truncate(dest_path, dest_prefixlen);
++		str_printfa(src_path, "%u", n-1);
++		str_printfa(dest_path, "%u.", uid);
++
++		if (rename(str_c(src_path), str_c(dest_path)) < 0) {
++			mailbox_set_critical(&ctx->mbox->box,
++				"rename(%s, %s) failed: %m",
++				str_c(src_path), str_c(dest_path));
++			ctx->failed = TRUE;
++			cydir_transaction_save_rollback(_ctx);
++			return -1;
++		}
++	}
++	return 0;
++}
++
++void cydir_transaction_save_commit_post(struct mail_save_context *_ctx,
++					struct mail_index_transaction_commit_result *result)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++
++	_ctx->transaction = NULL; /* transaction is already freed */
++
++	mail_index_sync_set_commit_result(ctx->sync_ctx->index_sync_ctx,
++					  result);
++
++	(void)cydir_sync_finish(&ctx->sync_ctx, TRUE);
++	cydir_transaction_save_rollback(_ctx);
++}
++
++void cydir_transaction_save_rollback(struct mail_save_context *_ctx)
++{
++	struct cydir_save_context *ctx = CYDIR_SAVECTX(_ctx);
++
++	if (!ctx->finished)
++		cydir_save_cancel(&ctx->ctx);
++
++	if (ctx->sync_ctx != NULL)
++		(void)cydir_sync_finish(&ctx->sync_ctx, FALSE);
++
++	i_free(ctx->tmp_basename);
++	i_free(ctx);
++}
+diff --git a/src/lib-storage/index/cydir/cydir-storage.c b/src/lib-storage/index/cydir/cydir-storage.c
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/cydir-storage.c
+@@ -0,0 +1,182 @@
++/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
++
++#include "lib.h"
++#include "mail-copy.h"
++#include "index-mail.h"
++#include "mailbox-list-private.h"
++#include "cydir-sync.h"
++#include "cydir-storage.h"
++
++#include <sys/stat.h>
++
++extern struct mail_storage cydir_storage;
++extern struct mailbox cydir_mailbox;
++
++static struct event_category event_category_cydir = {
++	.name = "cydir",
++	.parent = &event_category_storage,
++};
++
++static struct mail_storage *cydir_storage_alloc(void)
++{
++	struct cydir_storage *storage;
++	pool_t pool;
++
++	pool = pool_alloconly_create("cydir storage", 512+256);
++	storage = p_new(pool, struct cydir_storage, 1);
++	storage->storage = cydir_storage;
++	storage->storage.pool = pool;
++	return &storage->storage;
++}
++
++static void
++cydir_storage_get_list_settings(const struct mail_namespace *ns ATTR_UNUSED,
++				struct mailbox_list_settings *set)
++{
++	if (set->layout == NULL)
++		set->layout = MAILBOX_LIST_NAME_FS;
++	if (set->subscription_fname == NULL)
++		set->subscription_fname = CYDIR_SUBSCRIPTION_FILE_NAME;
++}
++
++static struct mailbox *
++cydir_mailbox_alloc(struct mail_storage *storage, struct mailbox_list *list,
++		    const char *vname, enum mailbox_flags flags)
++{
++	struct cydir_mailbox *mbox;
++	pool_t pool;
++
++	/* cydir can't work without index files */
++	flags &= ~MAILBOX_FLAG_NO_INDEX_FILES;
++
++	pool = pool_alloconly_create("cydir mailbox", 1024*3);
++	mbox = p_new(pool, struct cydir_mailbox, 1);
++	mbox->box = cydir_mailbox;
++	mbox->box.pool = pool;
++	mbox->box.storage = storage;
++	mbox->box.list = list;
++	mbox->box.mail_vfuncs = &cydir_mail_vfuncs;
++
++	index_storage_mailbox_alloc(&mbox->box, vname, flags, MAIL_INDEX_PREFIX);
++
++	mbox->storage = CYDIR_STORAGE(storage);
++	return &mbox->box;
++}
++
++static int cydir_mailbox_open(struct mailbox *box)
++{
++	const char *box_path = mailbox_get_path(box);
++	struct stat st;
++
++	if (stat(box_path, &st) == 0) {
++		/* exists, open it */
++	} else if (errno == ENOENT) {
++		mail_storage_set_error(box->storage, MAIL_ERROR_NOTFOUND,
++			T_MAIL_ERR_MAILBOX_NOT_FOUND(box->vname));
++		return -1;
++	} else if (errno == EACCES) {
++		mailbox_set_critical(box, "%s",
++			mail_error_eacces_msg("stat", box_path));
++		return -1;
++	} else {
++		mailbox_set_critical(box, "stat(%s) failed: %m", box_path);
++		return -1;
++	}
++	if (index_storage_mailbox_open(box, FALSE) < 0)
++		return -1;
++	mail_index_set_fsync_mode(box->index,
++				  box->storage->set->parsed_fsync_mode,
++				  MAIL_INDEX_FSYNC_MASK_APPENDS |
++				  MAIL_INDEX_FSYNC_MASK_EXPUNGES);
++	return 0;
++}
++
++static int
++cydir_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
++		     bool directory)
++{
++	int ret;
++
++	if ((ret = index_storage_mailbox_create(box, directory)) <= 0)
++		return ret;
++
++	return update == NULL ? 0 :
++		index_storage_mailbox_update(box, update);
++}
++
++static void cydir_notify_changes(struct mailbox *box)
++{
++	if (box->notify_callback == NULL)
++		mailbox_watch_remove_all(box);
++	else
++		mailbox_watch_add(box, mailbox_get_path(box));
++}
++
++struct mail_storage cydir_storage = {
++	.name = CYDIR_STORAGE_NAME,
++	.class_flags = MAIL_STORAGE_CLASS_FLAG_FILE_PER_MSG |
++		MAIL_STORAGE_CLASS_FLAG_BINARY_DATA,
++	.event_category = &event_category_cydir,
++
++	.v = {
++		NULL,
++		cydir_storage_alloc,
++		NULL,
++		index_storage_destroy,
++		NULL,
++		cydir_storage_get_list_settings,
++		NULL,
++		cydir_mailbox_alloc,
++		NULL,
++		NULL,
++	}
++};
++
++struct mailbox cydir_mailbox = {
++	.v = {
++		index_storage_is_readonly,
++		index_storage_mailbox_enable,
++		index_storage_mailbox_exists,
++		cydir_mailbox_open,
++		index_storage_mailbox_close,
++		index_storage_mailbox_free,
++		cydir_mailbox_create,
++		index_storage_mailbox_update,
++		index_storage_mailbox_delete,
++		index_storage_mailbox_rename,
++		index_storage_get_status,
++		index_mailbox_get_metadata,
++		index_storage_set_subscribed,
++		index_storage_attribute_set,
++		index_storage_attribute_get,
++		index_storage_attribute_iter_init,
++		index_storage_attribute_iter_next,
++		index_storage_attribute_iter_deinit,
++		index_storage_list_index_has_changed,
++		index_storage_list_index_update_sync,
++		cydir_storage_sync_init,
++		index_mailbox_sync_next,
++		index_mailbox_sync_deinit,
++		NULL,
++		cydir_notify_changes,
++		index_transaction_begin,
++		index_transaction_commit,
++		index_transaction_rollback,
++		NULL,
++		index_mail_alloc,
++		index_storage_search_init,
++		index_storage_search_deinit,
++		index_storage_search_next_nonblock,
++		index_storage_search_next_update_seq,
++		cydir_save_alloc,
++		cydir_save_begin,
++		cydir_save_continue,
++		cydir_save_finish,
++		cydir_save_cancel,
++		mail_storage_copy,
++		cydir_transaction_save_commit_pre,
++		cydir_transaction_save_commit_post,
++		cydir_transaction_save_rollback,
++		index_storage_is_inconsistent
++	}
++};
+diff --git a/src/lib-storage/index/cydir/cydir-storage.h b/src/lib-storage/index/cydir/cydir-storage.h
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/cydir-storage.h
+@@ -0,0 +1,35 @@
++#ifndef CYDIR_STORAGE_H
++#define CYDIR_STORAGE_H
++
++#include "index-storage.h"
++
++#define CYDIR_STORAGE_NAME "cydir"
++#define CYDIR_SUBSCRIPTION_FILE_NAME "subscriptions."
++
++struct cydir_storage {
++	struct mail_storage storage;
++};
++
++struct cydir_mailbox {
++	struct mailbox box;
++	struct cydir_storage *storage;
++};
++
++#define CYDIR_STORAGE(s)	container_of(s, struct cydir_storage, storage)
++#define CYDIR_MAILBOX(s)	container_of(s, struct cydir_mailbox, box)
++
++extern struct mail_vfuncs cydir_mail_vfuncs;
++
++struct mail_save_context *
++cydir_save_alloc(struct mailbox_transaction_context *_t);
++int cydir_save_begin(struct mail_save_context *ctx, struct istream *input);
++int cydir_save_continue(struct mail_save_context *ctx);
++int cydir_save_finish(struct mail_save_context *ctx);
++void cydir_save_cancel(struct mail_save_context *ctx);
++
++int cydir_transaction_save_commit_pre(struct mail_save_context *ctx);
++void cydir_transaction_save_commit_post(struct mail_save_context *ctx,
++					struct mail_index_transaction_commit_result *result);
++void cydir_transaction_save_rollback(struct mail_save_context *ctx);
++
++#endif
+diff --git a/src/lib-storage/index/cydir/cydir-sync.c b/src/lib-storage/index/cydir/cydir-sync.c
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/cydir-sync.c
+@@ -0,0 +1,172 @@
++/* Copyright (c) 2007-2018 Dovecot authors, see the included COPYING file */
++
++#include "lib.h"
++#include "ioloop.h"
++#include "str.h"
++#include "cydir-storage.h"
++#include "cydir-sync.h"
++#include "mailbox-recent-flags.h"
++
++static void cydir_sync_set_uidvalidity(struct cydir_sync_context *ctx)
++{
++	uint32_t uid_validity = ioloop_time;
++
++	mail_index_update_header(ctx->trans,
++		offsetof(struct mail_index_header, uid_validity),
++		&uid_validity, sizeof(uid_validity), TRUE);
++	ctx->uid_validity = uid_validity;
++}
++
++static string_t *cydir_get_path_prefix(struct cydir_mailbox *mbox)
++{
++	string_t *path = str_new(default_pool, 256);
++
++	str_append(path, mailbox_get_path(&mbox->box));
++	str_append_c(path, '/');
++	return path;
++}
++
++static void
++cydir_sync_expunge(struct cydir_sync_context *ctx, uint32_t seq1, uint32_t seq2)
++{
++	struct mailbox *box = &ctx->mbox->box;
++	uint32_t uid;
++
++	if (ctx->path == NULL) {
++		ctx->path = cydir_get_path_prefix(ctx->mbox);
++		ctx->path_dir_prefix_len = str_len(ctx->path);
++	}
++
++	for (; seq1 <= seq2; seq1++) {
++		mail_index_lookup_uid(ctx->sync_view, seq1, &uid);
++
++		str_truncate(ctx->path, ctx->path_dir_prefix_len);
++		str_printfa(ctx->path, "%u.", uid);
++		if (i_unlink_if_exists(str_c(ctx->path)) < 0) {
++			/* continue anyway */
++		} else {
++			if (box->v.sync_notify != NULL) {
++				box->v.sync_notify(box, uid,
++						   MAILBOX_SYNC_TYPE_EXPUNGE);
++			}
++			mail_index_expunge(ctx->trans, seq1);
++		}
++	}
++}
++
++static void cydir_sync_index(struct cydir_sync_context *ctx)
++{
++	struct mailbox *box = &ctx->mbox->box;
++	const struct mail_index_header *hdr;
++	struct mail_index_sync_rec sync_rec;
++	uint32_t seq1, seq2;
++
++	hdr = mail_index_get_header(ctx->sync_view);
++	if (hdr->uid_validity != 0)
++		ctx->uid_validity = hdr->uid_validity;
++	else
++		cydir_sync_set_uidvalidity(ctx);
++
++	/* mark the newly seen messages as recent */
++	if (mail_index_lookup_seq_range(ctx->sync_view, hdr->first_recent_uid,
++					hdr->next_uid, &seq1, &seq2)) {
++		mailbox_recent_flags_set_seqs(&ctx->mbox->box, ctx->sync_view,
++					      seq1, seq2);
++	}
++
++	while (mail_index_sync_next(ctx->index_sync_ctx, &sync_rec)) {
++		if (!mail_index_lookup_seq_range(ctx->sync_view,
++						 sync_rec.uid1, sync_rec.uid2,
++						 &seq1, &seq2)) {
++			/* already expunged, nothing to do. */
++			continue;
++		}
++
++		switch (sync_rec.type) {
++		case MAIL_INDEX_SYNC_TYPE_EXPUNGE:
++			cydir_sync_expunge(ctx, seq1, seq2);
++			break;
++		case MAIL_INDEX_SYNC_TYPE_FLAGS:
++		case MAIL_INDEX_SYNC_TYPE_KEYWORD_ADD:
++		case MAIL_INDEX_SYNC_TYPE_KEYWORD_REMOVE:
++			/* FIXME: should be bother calling sync_notify()? */
++			break;
++		}
++	}
++
++	if (box->v.sync_notify != NULL)
++		box->v.sync_notify(box, 0, 0);
++}
++
++int cydir_sync_begin(struct cydir_mailbox *mbox,
++		     struct cydir_sync_context **ctx_r, bool force)
++{
++	struct cydir_sync_context *ctx;
++	enum mail_index_sync_flags sync_flags;
++	int ret;
++
++	ctx = i_new(struct cydir_sync_context, 1);
++	ctx->mbox = mbox;
++
++	sync_flags = index_storage_get_sync_flags(&mbox->box) |
++		MAIL_INDEX_SYNC_FLAG_FLUSH_DIRTY;
++	if (!force)
++		sync_flags |= MAIL_INDEX_SYNC_FLAG_REQUIRE_CHANGES;
++
++	ret = index_storage_expunged_sync_begin(&mbox->box, &ctx->index_sync_ctx,
++						&ctx->sync_view, &ctx->trans,
++						sync_flags);
++	if (ret <= 0) {
++		i_free(ctx);
++		*ctx_r = NULL;
++		return ret;
++	}
++
++	cydir_sync_index(ctx);
++	index_storage_expunging_deinit(&mbox->box);
++
++	*ctx_r = ctx;
++	return 0;
++}
++
++int cydir_sync_finish(struct cydir_sync_context **_ctx, bool success)
++{
++	struct cydir_sync_context *ctx = *_ctx;
++	int ret = success ? 0 : -1;
++
++	*_ctx = NULL;
++	if (success) {
++		if (mail_index_sync_commit(&ctx->index_sync_ctx) < 0) {
++			mailbox_set_index_error(&ctx->mbox->box);
++			ret = -1;
++		}
++	} else {
++		mail_index_sync_rollback(&ctx->index_sync_ctx);
++	}
++	str_free(&ctx->path);
++	i_free(ctx);
++	return ret;
++}
++
++static int cydir_sync(struct cydir_mailbox *mbox)
++{
++	struct cydir_sync_context *sync_ctx;
++
++	if (cydir_sync_begin(mbox, &sync_ctx, FALSE) < 0)
++		return -1;
++
++	return sync_ctx == NULL ? 0 :
++		cydir_sync_finish(&sync_ctx, TRUE);
++}
++
++struct mailbox_sync_context *
++cydir_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags)
++{
++	struct cydir_mailbox *mbox = CYDIR_MAILBOX(box);
++	int ret = 0;
++
++	if (index_mailbox_want_full_sync(&mbox->box, flags))
++		ret = cydir_sync(mbox);
++
++	return index_mailbox_sync_init(box, flags, ret < 0);
++}
+diff --git a/src/lib-storage/index/cydir/cydir-sync.h b/src/lib-storage/index/cydir/cydir-sync.h
+new file mode 100644
+--- /dev/null
++++ b/src/lib-storage/index/cydir/cydir-sync.h
+@@ -0,0 +1,24 @@
++#ifndef CYDIR_SYNC_H
++#define CYDIR_SYNC_H
++
++struct mailbox;
++
++struct cydir_sync_context {
++	struct cydir_mailbox *mbox;
++        struct mail_index_sync_ctx *index_sync_ctx;
++	struct mail_index_view *sync_view;
++	struct mail_index_transaction *trans;
++
++	string_t *path;
++	size_t path_dir_prefix_len;
++	uint32_t uid_validity;
++};
++
++int cydir_sync_begin(struct cydir_mailbox *mbox,
++		     struct cydir_sync_context **ctx_r, bool force);
++int cydir_sync_finish(struct cydir_sync_context **ctx, bool success);
++
++struct mailbox_sync_context *
++cydir_storage_sync_init(struct mailbox *box, enum mailbox_sync_flags flags);
++
++#endif
+diff --git a/src/lib-storage/mail-storage-register.c b/src/lib-storage/mail-storage-register.c
+--- a/src/lib-storage/mail-storage-register.c
++++ b/src/lib-storage/mail-storage-register.c
+@@ -10,6 +10,7 @@ extern struct mail_storage mdbox_deleted
+ extern struct mail_storage sdbox_storage;
+ extern struct mail_storage maildir_storage;
+ extern struct mail_storage mbox_storage;
++extern struct mail_storage cydir_storage;
+ extern struct mail_storage imapc_storage;
+ extern struct mail_storage pop3c_storage;
+ extern struct mail_storage raw_storage;
+@@ -24,6 +25,7 @@ void mail_storage_register_all(void)
+ 	mail_storage_class_register(&sdbox_storage);
+ 	mail_storage_class_register(&maildir_storage);
+ 	mail_storage_class_register(&mbox_storage);
++	mail_storage_class_register(&cydir_storage);
+ 	mail_storage_class_register(&imapc_storage);
+ 	mail_storage_class_register(&pop3c_storage);
+ 	mail_storage_class_register(&raw_storage);
